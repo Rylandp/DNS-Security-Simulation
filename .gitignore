@@ -2,8 +2,9 @@ EXAMPLE secure_message.py
 attacker_private.pem
 attacker_public.pem
 server_private.pem
-server_public.pem
 user_private.pem
 user_public.pem
 Assignment Document.pdf
 Assignment Doc.md
+__pycache__/
+*.py[cod]

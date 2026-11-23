@@ -1,50 +1,29 @@
-"""
-Secure message demo (single machine, no network).
-
-User A (sender) -> User B (receiver)
-
-SENDER (User A):
-  1. Type a message
-  2. Generate a random AES-256 key and encrypt the message (AES-GCM)
-  3. Encrypt the AES key with User B's PUBLIC key (RSA-OAEP)
-  4. Hash the message (SHA-256)
-  5. Sign the hash with User A's PRIVATE key (RSA-PSS)
-
-RECEIVER (User B):
-  1. Decrypt the AES key with User B's PRIVATE key
-  2. Decrypt the message with the AES key
-  3. Hash the decrypted message (SHA-256)
-  4. Verify the signature with User A's PUBLIC key
-
-Requires:  pip install cryptography
-Run:       python secure_message.py
-"""
-
-import os
 import base64
 import hashlib
 import socket
 from getpass import getpass
 from pathlib import Path
+import json
+import time
 
-from cryptography.hazmat.primitives.asymmetric import rsa, padding, utils
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.exceptions import InvalidSignature, InvalidTag
+from cryptography.exceptions import InvalidSignature
 
 
 # ---------- helpers ----------
-def b64(data: bytes) -> str:
-    """Show bytes as readable base64 text (shortened if long)."""
-    s = base64.b64encode(data).decode()
-    return s if len(s) <= 60 else s[:60] + "..."
+def public_key_der(public_key) -> bytes:
+    return public_key.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
 
 
-OAEP = padding.OAEP(
-    mgf=padding.MGF1(algorithm=hashes.SHA256()),
-    algorithm=hashes.SHA256(),
-    label=None,
-)
+def key_fingerprint(public_key) -> str:
+    """Return the SHA-256 fingerprint used as the key identifier."""
+    return hashlib.sha256(public_key_der(public_key)).hexdigest()
+
 PSS = padding.PSS(
     mgf=padding.MGF1(hashes.SHA256()),
     salt_length=padding.PSS.MAX_LENGTH,
@@ -58,11 +37,13 @@ def canonical_record(
     expiration: int,
     transaction_id: str,
     nonce: str,
+    ttl: int,
 ) -> bytes:
     fields = [
         name.rstrip(".").lower(),
         record_type.upper(),
         address,
+        str(ttl),
         key_id,
         str(inception),
         str(expiration),
@@ -126,103 +107,6 @@ def load_or_create_server_keys():
     return private_key, public_key
 
 
-# ---------- sender (User A) ----------
-def sender_encrypt_and_sign(message: str, receiver_public_key, sender_private_key):
-    print("\n========== SENDER (User A) ==========")
-    data = message.encode("utf-8")
-
-    # 1. AES key + encrypt message
-    aes_key = AESGCM.generate_key(bit_length=256)
-    nonce = os.urandom(12)
-    ciphertext = AESGCM(aes_key).encrypt(nonce, data, None)
-    print(f"[1] AES-256 key generated : {b64(aes_key)}")
-    print(f"[2] Encrypted message     : {b64(ciphertext)}")
-
-    # 2. Encrypt AES key with receiver's public key
-    encrypted_aes_key = receiver_public_key.encrypt(aes_key, OAEP)
-    print(f"[3] AES key encrypted with User B's public key: {b64(encrypted_aes_key)}")
-
-    # 3. Hash the message
-    digest = hashlib.sha256(data).digest()
-    print(f"[4] SHA-256 hash of message: {digest.hex()}")
-
-    # 4. Sign the hash with sender's private key
-    signature = sender_private_key.sign(
-        digest, PSS, utils.Prehashed(hashes.SHA256())
-    )
-    print(f"[5] Signature (User A's private key): {b64(signature)}")
-
-    # This bundle is what would be "sent" to User B
-    return {
-        "encrypted_aes_key": encrypted_aes_key,
-        "nonce": nonce,
-        "ciphertext": ciphertext,
-        "signature": signature,
-    }
-
-
-# ---------- receiver (User B) ----------
-def receiver_decrypt_and_verify(package, receiver_private_key, sender_public_key):
-    print("\n========== RECEIVER (User B) ==========")
-
-    # 1. Recover AES key with receiver's private key
-    try:
-        aes_key = receiver_private_key.decrypt(package["encrypted_aes_key"], OAEP)
-    except ValueError:
-        print("[X] Could not decrypt the AES key (wrong key or corrupted).")
-        return None
-    print(f"[1] AES key recovered with User B's private key: {b64(aes_key)}")
-
-    # 2. Decrypt the message (GCM also checks it wasn't modified)
-    try:
-        data = AESGCM(aes_key).decrypt(package["nonce"], package["ciphertext"], None)
-    except InvalidTag:
-        print("[X] Decryption failed: ciphertext was tampered with.")
-        return None
-    message = data.decode("utf-8")
-    print(f"[2] Decrypted message: {message}")
-
-    # 3. Hash the decrypted message
-    digest = hashlib.sha256(data).digest()
-    print(f"[3] SHA-256 hash of decrypted message: {digest.hex()}")
-
-    # 4. Verify signature with sender's public key
-    try:
-        sender_public_key.verify(
-            package["signature"], digest, PSS, utils.Prehashed(hashes.SHA256())
-        )
-        print("[4] Signature VALID: message is from User A and unchanged.")
-    except InvalidSignature:
-        print("[X] Signature INVALID: not from User A, or message was altered.")
-        return None
-
-    return message
-
-
-# ---------- tamper tests ----------
-def tamper_tests(package, server_private, user_public, attacker_private):
-    print("\n========== TAMPER TESTS ==========")
-
-    print("\n--- Test 1: attacker flips one bit of the ciphertext ---")
-    bad = dict(package)
-    ct = bytearray(bad["ciphertext"])
-    ct[0] ^= 1
-    bad["ciphertext"] = bytes(ct)
-    receiver_decrypt_and_verify(bad, server_private, user_public)
-
-    print("\n--- Test 2: attacker (User C) re-signs it with their own key ---")
-    aes_key = server_private.decrypt(package["encrypted_aes_key"], OAEP)
-    data = AESGCM(aes_key).decrypt(package["nonce"], package["ciphertext"], None)
-    fake = dict(package)
-    fake["signature"] = attacker_private.sign(
-        hashlib.sha256(data).digest(), PSS, utils.Prehashed(hashes.SHA256())
-    )
-    receiver_decrypt_and_verify(fake, server_private, user_public)
-
-
-
-
-
 
 def run_server(server, server_private, server_public):
     server.listen(5)
@@ -238,10 +122,72 @@ def run_server(server, server_private, server_public):
 
 
 def handle_request(data, server_private, server_public):
-    address = DNS_RECORDS.get((name.lower(), record_type.upper()))
+    query = json.loads(data.decode("utf-8"))
+    name = query.get("name", "").rstrip(".").lower()
+    record_type = query.get("record_type", "").upper()
+    address = DNS_RECORDS.get((name, record_type))
     if address is None:
-        print("Error ")
-    return
+        errResponse = {
+                "type": "DNS_RESPONSE",
+                "status": "FAILURE",
+                "name": name,
+                "record_type": record_type,
+                "address": address,
+                "error": f"No {record_type} record found for {name}."
+            }
+        print(f"Error: Record type {record_type} is not available for {name}")
+        return json.dumps(errResponse).encode("utf-8")
+
+    ttl = 60
+    inception = int(time.time())
+    key_id = key_fingerprint(server_public)
+    nonce = query.get("nonce")
+    transaction_id = query.get("transaction_id")
+    expiration = inception + ttl
+    
+    server_public_pem = server_public.public_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+)
+
+    record = canonical_record(
+                name,
+                record_type,
+                address,
+                key_id,
+                inception,
+                expiration,
+                transaction_id,
+                nonce,
+                ttl,
+            ) 
+    
+    
+    signature = server_private.sign(
+                record,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH,
+                ),
+                hashes.SHA256(),
+            )
+    
+    response = {
+                "type": "DNS_RESPONSE",
+                "status": "SUCCESS",
+                "transaction_id": transaction_id,
+                "nonce": nonce,
+                "name": name,
+                "record_type": record_type,
+                "address": address,
+                "ttl": ttl,
+                "key_id": key_id,
+                "public_key": base64.b64encode(server_public_pem).decode("ascii"),
+                "inception": inception,
+                "expiration": expiration,
+                "signature": base64.b64encode(signature).decode("ascii"),
+    }
+    return json.dumps(response).encode("utf-8")
 
     
 
@@ -259,7 +205,8 @@ def main():
         1_700_000_000,
         1_800_000_000,
         "tx-001",
-        "0123456789abcdef"
+        "0123456789abcdef",
+        60
     )
 
     # Sign signature and verify
@@ -286,6 +233,8 @@ def main():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.bind(("127.0.0.1", 5300))
         run_server(server, server_private, server_public)
+
+    
 
 
 
