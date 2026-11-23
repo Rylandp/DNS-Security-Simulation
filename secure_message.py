@@ -23,6 +23,9 @@ Run:       python secure_message.py
 import os
 import base64
 import hashlib
+import socket
+from getpass import getpass
+from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric import rsa, padding, utils
 from cryptography.hazmat.primitives import hashes, serialization
@@ -46,6 +49,36 @@ PSS = padding.PSS(
     mgf=padding.MGF1(hashes.SHA256()),
     salt_length=padding.PSS.MAX_LENGTH,
 )
+def canonical_record(
+    name: str,
+    record_type: str,
+    address: str,
+    key_id: str,
+    inception: int,
+    expiration: int,
+    transaction_id: str,
+    nonce: str,
+) -> bytes:
+    fields = [
+        name.rstrip(".").lower(),
+        record_type.upper(),
+        address,
+        key_id,
+        str(inception),
+        str(expiration),
+        transaction_id,
+        nonce,
+    ]
+
+    if any(not field or "|" in field for field in fields):
+        raise ValueError("Canonical record fields must be non-empty and cannot contain '|'")
+
+    return "|".join(fields).encode("utf-8")
+
+DNS_RECORDS = {
+    ("www.example.com", "A"): "192.168.1.10",
+    ("mail.example.com", "A"): "192.168.1.20",
+}
 
 
 # ---------- key setup ----------
@@ -66,6 +99,30 @@ def generate_keypair(name: str, password: bytes):
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         ))
     print(f"  Created {name}_private.pem and {name}_public.pem")
+    return private_key, public_key
+
+def load_or_create_server_keys():
+    private_path = Path("server_private.pem")
+    public_path = Path("server_public.pem")
+
+    if private_path.exists() != public_path.exists():
+        raise FileNotFoundError(
+            "Expected both server key files, or neither. Restore or remove the remaining file."
+        )
+
+    password = getpass("Server private-key password: ").encode("utf-8")
+
+    if not private_path.exists():
+        return generate_keypair("server", password)
+
+    with private_path.open("rb") as f:
+        private_key = serialization.load_pem_private_key(
+            f.read(), password=password
+        )
+
+    with public_path.open("rb") as f:
+        public_key = serialization.load_pem_public_key(f.read())
+
     return private_key, public_key
 
 
@@ -143,7 +200,7 @@ def receiver_decrypt_and_verify(package, receiver_private_key, sender_public_key
 
 
 # ---------- tamper tests ----------
-def tamper_tests(package, b_private, a_public, c_private):
+def tamper_tests(package, server_private, user_public, attacker_private):
     print("\n========== TAMPER TESTS ==========")
 
     print("\n--- Test 1: attacker flips one bit of the ciphertext ---")
@@ -151,36 +208,87 @@ def tamper_tests(package, b_private, a_public, c_private):
     ct = bytearray(bad["ciphertext"])
     ct[0] ^= 1
     bad["ciphertext"] = bytes(ct)
-    receiver_decrypt_and_verify(bad, b_private, a_public)
+    receiver_decrypt_and_verify(bad, server_private, user_public)
 
     print("\n--- Test 2: attacker (User C) re-signs it with their own key ---")
-    aes_key = b_private.decrypt(package["encrypted_aes_key"], OAEP)
+    aes_key = server_private.decrypt(package["encrypted_aes_key"], OAEP)
     data = AESGCM(aes_key).decrypt(package["nonce"], package["ciphertext"], None)
     fake = dict(package)
-    fake["signature"] = c_private.sign(
+    fake["signature"] = attacker_private.sign(
         hashlib.sha256(data).digest(), PSS, utils.Prehashed(hashes.SHA256())
     )
-    receiver_decrypt_and_verify(fake, b_private, a_public)
+    receiver_decrypt_and_verify(fake, server_private, user_public)
+
+
+
+
+
+
+def run_server(server, server_private, server_public):
+    server.listen(5)
+    while True:
+        connection, address = server.accept()
+        with connection:
+            data = connection.recv(4096)
+            if not data:
+                continue
+
+            response = handle_request(data, server_private, server_public)
+            connection.sendall(response)
+
+
+def handle_request(data, server_private, server_public):
+    address = DNS_RECORDS.get((name.lower(), record_type.upper()))
+    if address is None:
+        print("Error ")
+    return
+
+    
 
 
 # ---------- main ----------
 def main():
-    print("Generating keys...")
-    a_private, a_public = generate_keypair("userA", b"passwordA")
-    b_private, b_public = generate_keypair("userB", b"passwordB")
-    c_private, _ = generate_keypair("userC_attacker", b"passwordC")
+    # Creates keys in a file, loads them if files exist
+    server_private, server_public = load_or_create_server_keys()
 
-    message = input("\nEnter a message to send from User A to User B: ")
+    record_bytes = canonical_record(
+        "www.example.com",
+        "A",
+        "192.168.1.10",
+        "example-key-id",
+        1_700_000_000,
+        1_800_000_000,
+        "tx-001",
+        "0123456789abcdef"
+    )
 
-    package = sender_encrypt_and_sign(message, b_public, a_private)
-    result = receiver_decrypt_and_verify(package, b_private, a_public)
+    # Sign signature and verify
+    signature = server_private.sign(record_bytes, PSS, hashes.SHA256())
+    server_public.verify(signature, record_bytes, PSS, hashes.SHA256())
+    print("Valid Sig before tampering")
+    
+    # Tamper signature and verify
+    altered_record = record_bytes.replace(
+    b"192.168.1.10",
+    b"192.168.1.99",
+    )
+    print("Tampering signature...")
+    try:
+        server_public.verify(signature, altered_record, PSS, hashes.SHA256())
+    except InvalidSignature:
+        print("Tampering successfully rejected")
+    else:
+        raise AssertionError("Changed record unexpectedly passed verification")
 
-    if result is not None:
-        print(f"\nSUCCESS. User B received: \"{result}\"")
-        print(f"Matches original: {result == message}")
 
-    if input("\nRun tamper tests? (y/n): ").strip().lower() == "y":
-        tamper_tests(package, b_private, a_public, c_private)
+
+    
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.bind(("127.0.0.1", 5300))
+        run_server(server, server_private, server_public)
+
+
+
 
 
 if __name__ == "__main__":
