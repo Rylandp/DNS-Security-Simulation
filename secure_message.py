@@ -5,6 +5,7 @@ from getpass import getpass
 from pathlib import Path
 import json
 import time
+import sys
 
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes, serialization
@@ -110,16 +111,41 @@ def load_or_create_server_keys():
 
 def run_server(server, server_private, server_public):
     server.listen(5)
-    while True:
-        connection, address = server.accept()
-        with connection:
-            data = connection.recv(4096)
-            if not data:
+    server.settimeout(1.0)
+    try:
+        while True:
+            try:
+                connection, address = server.accept()
+            except socket.timeout:
                 continue
+            with connection:
+                data = connection.recv(4096)
+                if not data:
+                    continue
 
-            response = handle_request(data, server_private, server_public)
-            connection.sendall(response)
+                response = handle_request(data, server_private, server_public)
+                connection.sendall(response)
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
+        sys.exit()
 
+def run_client(host, port, name, record_type):
+    # client query 
+    dns_query = {
+    "type": "DNS_QUERY",
+    "transaction_id": "tx-001",
+    "name": name,
+    "record_type": record_type,
+    "nonce": "123abc",
+    }
+    
+    query_bytes = json.dumps(dns_query).encode("utf-8")
+    with socket.create_connection((host, port)) as client:
+        client.sendall(query_bytes)
+        response_bytes = client.recv(4096)
+
+    response = json.loads(response_bytes.decode("utf-8"))
+    print(response)
 
 def handle_request(data, server_private, server_public):
     query = json.loads(data.decode("utf-8"))
@@ -233,8 +259,7 @@ def main():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.bind(("127.0.0.1", 5300))
         run_server(server, server_private, server_public)
-
-    
+   
 
 
 
