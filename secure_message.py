@@ -133,12 +133,14 @@ def run_server(server, server_private, server_public):
 
 def run_client(host, port, name, record_type):
     # client query 
+    transaction_id = secrets.token_hex(8)
+    nonce = secrets.token_hex(16)
     dns_query = {
     "type": "DNS_QUERY",
-    "transaction_id": "tx-001",
+    "transaction_id": transaction_id,
     "name": name,
     "record_type": record_type,
-    "nonce": "123abc",
+    "nonce": nonce,
     }
     
     query_bytes = json.dumps(dns_query).encode("utf-8")
