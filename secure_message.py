@@ -6,6 +6,8 @@ from pathlib import Path
 import json
 import time
 import sys
+import secrets
+import ipaddress
 
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes, serialization
@@ -145,7 +147,87 @@ def run_client(host, port, name, record_type):
         response_bytes = client.recv(4096)
 
     response = json.loads(response_bytes.decode("utf-8"))
-    print(response)
+
+
+    #--------------TAMPER TESTS -- RAN ONE AT A TIME--------------
+    
+    #response["address"] = "192.168.1.99"
+
+    #response["transaction_id"] = "old-transaction"  # transaction ID mismatch
+
+    #response["nonce"] = "old-nonce"                 # nonce mismatch
+
+    #response["expiration"] = int(time.time()) - 1   # expired response
+    
+    #response["key_id"] = "0" * 64                   # key ID mismatch
+
+    #signature = bytearray(base64.b64decode(response["signature"])); signature[0] ^= 1; response["signature"] = base64.b64encode(signature).decode("ascii")
+
+
+    #--------------------END TAMPER TESTS--------------------------
+
+
+
+    
+    trusted_key = serialization.load_pem_public_key(Path("server_public.pem").read_bytes())
+
+    if response.get("status") != "SUCCESS":
+        raise ValueError(response.get("error", "Server returned an error"))
+
+    if response.get("transaction_id") != dns_query["transaction_id"]:
+        raise ValueError("Transaction ID mismatch")
+
+    if response.get("nonce") != dns_query["nonce"]:
+        raise ValueError("Nonce mismatch")
+
+    now = int(time.time())
+    if not response["inception"] <= now <= response["expiration"]:
+        raise ValueError("Response is expired or not yet valid")
+
+    if response.get("key_id") != key_fingerprint(trusted_key):
+        raise ValueError("Trusted key mismatch")
+
+    response_key = serialization.load_pem_public_key(base64.b64decode(response["public_key"]))
+    if public_key_der(response_key) != public_key_der(trusted_key):
+        raise ValueError("Response public key does not match the trusted key")
+
+    if response.get("type") != "DNS_RESPONSE":
+        raise ValueError("Unexpected response type")
+
+    if response.get("status") != "SUCCESS":
+        raise ValueError(response.get("error", "Server returned an error"))
+
+    if response.get("name") != name.rstrip(".").lower():
+        raise ValueError("Response name does not match the query")
+
+    if response.get("record_type") != record_type.upper():
+        raise ValueError("Response record type does not match the query")
+
+    if record_type.upper() != "A":
+        raise ValueError("This demo only supports A records")
+
+    ipaddress.IPv4Address(response["address"])
+
+    signed_record = canonical_record(
+        response["name"],
+        response["record_type"],
+        response["address"],
+        response["key_id"],
+        response["inception"],
+        response["expiration"],
+        response["transaction_id"],
+        response["nonce"],
+        response["ttl"],
+    )
+
+    signature = base64.b64decode(response["signature"])
+
+    try:
+        trusted_key.verify(signature, signed_record, PSS, hashes.SHA256())
+    except InvalidSignature as exc:
+        raise ValueError("DNS signature is invalid; refusing the address") from exc
+
+    print("Verified address:", response["address"])
 
 def handle_request(data, server_private, server_public):
     query = json.loads(data.decode("utf-8"))
